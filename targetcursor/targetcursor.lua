@@ -1,7 +1,7 @@
 addon.name    = 'targetcursor'
 addon.author  = 'Jyouya (original), yzyii (sub cursor), Hiken (fork)'
-addon.version = '1.0'
-addon.desc    = 'Replaces the target cursor with your own art, anchored correctly on every model'
+addon.version = '1.1'
+addon.desc    = 'Displays a cursor of your choice that can be colored and scaled, anchored correctly on every model'
 
 -- A fork of `customtarget`, written by Jyouya and extended by yzyii, whose v0.6
 -- this started from. Horizontal position from the model's render base, height
@@ -43,7 +43,7 @@ local subCursorOpacity = 1.0   -- sub cursor.  default: 1.0  (0.80 matches the g
 
 -- * Main cursor tint * --
 -- nil = draw the cursor art exactly as it is (default).
--- Set to { r, g, b } to recolor it, e.g. { 120, 255, 140 } for green.
+-- Set to {r,g,b} to recolor it, e.g. {120,255,140} for green.
 -- The tint is a MULTIPLY, so it is applied to the neutral (gray) sheet below
 -- rather than the colored art - tinting already-colored art muddies it.
 local colorMainCursor = nil    -- default: nil
@@ -53,9 +53,9 @@ local colorMainCursor = nil    -- default: nil
 -- The game tints its sub cursor by whether the selected action reaches the
 -- target. Sampled from the game's own cursor, applied to the neutral sheet.
 local rangeColors     = true               -- default: true
-local colorInRange    = { 121, 107, 255 }  -- blue  - action will reach.     default: { 121, 107, 255 }
-local colorNearRange  = { 255, 255, 103 }  -- yellow- just out of reach.     default: { 255, 255, 103 }
-local colorOutOfRange = { 255, 108,  97 }  -- red   - out of range.          default: { 255, 108,  97 }
+local colorInRange    = {121,107,255}  -- blue  - action will reach.     default: {121,107,255}
+local colorNearRange  = {255,255,103}  -- yellow- just out of reach.     default: {255,255,103}
+local colorOutOfRange = {255,108,97}  -- red   - out of range.          default: {255,108,97}
 -- Neutral (gray) sheet, used both by the range colors above and by
 -- colorMainCursor. Tinting already-colored art multiplies the two and muddies it.
 --
@@ -480,8 +480,23 @@ ashita.events.register('load', 'targetcursor_load', function()
         -- Determine if we are currently subtargetting
         local isSubTargetActive = target:GetIsSubTargetActive()
 
-        -- Exit early if we don't have a target
-        if (target:GetIsActive(isSubTargetActive) == 0) then
+        -- Exit early only if NEITHER slot has an active target.
+        --
+        -- This used to be target:GetIsActive(isSubTargetActive) - checking only
+        -- the slot isSubTargetActive currently points at. Bug: fighting mob A
+        -- (locked, slot 0) while sub-targeting an ability onto mob B (slot 1)
+        -- and mob A dies mid-selection clears slot 0's Active flag; with
+        -- isSubTargetActive still 1 that alone should not have mattered, but
+        -- the client also appears to drop out of sub-targeting the instant its
+        -- locked target dies, which flips isSubTargetActive to 0 THIS SAME
+        -- FRAME - so the very next line ends up testing slot 0 (mob A, now
+        -- dead) instead of slot 1 (mob B, still a live, still-valid subtarget).
+        -- That single check then bailed out of the WHOLE frame, before the
+        -- independent targetIndexSub branch below ever ran - erasing the still-
+        -- valid sub cursor over mob B along with the main cursor. The real
+        -- client keeps its own cursor over mob B in this situation; checking
+        -- both slots here before giving up lets this addon do the same.
+        if (target:GetIsActive(0) == 0 and target:GetIsActive(1) == 0) then
             return
         end
 
@@ -540,12 +555,22 @@ ashita.events.register('load', 'targetcursor_load', function()
         -- Advance the shimmer animation for this frame
         setAnimFrame()
 
-        -- Get target cursor position
-        local ndcZ = nil
-        cursorPos.x, cursorPos.y, ndcZ = getPos(targetIndex, isSubTargetActive)
+        -- Get target cursor position.
+        --
+        -- getPos returns nil, nil, nil when it cannot place this target at
+        -- all - no entity index AND no target-struct actor pointer, which is
+        -- exactly the state of a target that JUST DIED. Assigning nil straight
+        -- into cursorPos.x/y would store nil into an FFI float field and
+        -- throw, and an uncaught throw here kills the rest of this frame's
+        -- drawing - every frame, until /addon reload - because nothing after
+        -- it in this callback runs. Land the result in plain locals first and
+        -- only touch the FFI vector once ndcZ confirms there is a real
+        -- position to draw.
+        local px, py, ndcZ = getPos(targetIndex, isSubTargetActive)
 
         -- Test if target cursor is in the viewing volume
         if (ndcZ ~= nil and ndcZ >= 0 and ndcZ <= 1) then
+            cursorPos.x, cursorPos.y = px, py
             local flags = target:GetSubTargetFlags()
 
             -- Is the game showing its blue selection cursor? If so the addon
@@ -562,16 +587,18 @@ ashita.events.register('load', 'targetcursor_load', function()
         end
 
         if (targetIndexSub) then
-		    -- Get subtarget cursor position
-            local ndcZSub = nil
-            cursorPosSub.x, cursorPosSub.y, ndcZSub = getPos(targetIndexSub, 0)
-
-            -- Pad subtarget
-            cursorPosSub.y = cursorPosSub.y - 10
+		    -- Get subtarget cursor position. Same nil hazard as above, and the
+            -- exact one that was crashing every frame once the early-exit fix
+            -- stopped hiding it: targetIndexSub still pointed at the just-died
+            -- locked target, getPos correctly gave up and returned nil, and
+            -- the old code assigned that nil straight into cursorPosSub.x/y -
+            -- via the "Pad subtarget" line below - before ever checking it.
+            local pxSub, pySub, ndcZSub = getPos(targetIndexSub, 0)
 
             -- Test if subtarget cursor is in the viewing volume
             if (ndcZSub ~= nil and ndcZSub >= 0 and ndcZSub <= 1) then
-                -- Draw the subtarget cursor
+                -- Pad subtarget, then draw it
+                cursorPosSub.x, cursorPosSub.y = pxSub, pySub - 10
                 drawSub(targetIndexSub, cursorPosSub)
             end
 
