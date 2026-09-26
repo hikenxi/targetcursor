@@ -20,9 +20,12 @@ v0.6 this started from.
   cursor; all three are editable
 - **Animated** — all six frames at the game's own 15fps
 - **Three art styles included**, each with a hi-res sheet
+- **Doors and NPCs handled** — including moghouse doors, which have no entity
 - **Tint and opacity** — optional recolor of the main cursor, separate opacity
   for each
-- **Doors and NPCs handled** — including moghouse doors, which have no entity
+
+<img width="2560" height="600" alt="targetcursor-banner" src="https://github.com/user-attachments/assets/0a9dee67-026e-4b7c-b892-640006cb6068" />
+
 
 ## Install
 
