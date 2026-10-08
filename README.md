@@ -62,9 +62,9 @@ The settings you are most likely to touch:
 | `cursorWidth` / `cursorHeight` | frame size — **must match the art**, see below |
 | `cursorScaleFactor` | on-screen size |
 | `cursorOpacity` / `subCursorOpacity` | transparency, 1.0 = art as-is |
-| `colorMainCursor` | optional `{ r, g, b }` recolor of the main cursor |
+| `colorMainCursor` | optional `{r,g,b}` recolor of the main cursor |
 | `rangeColors` | set to `false` to disable range tinting entirely |
-| `colorInRange` / `colorNearRange` / `colorOutOfRange` | the three range colors, as `{ r, g, b }` |
+| `colorInRange` / `colorNearRange` / `colorOutOfRange` | the three range colors, as `{r,g,b}` |
 
 ### Included art
 

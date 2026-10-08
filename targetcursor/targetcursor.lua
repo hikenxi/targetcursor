@@ -1,6 +1,6 @@
 addon.name    = 'targetcursor'
 addon.author  = 'Jyouya (original), yzyii (sub cursor), Hiken (fork)'
-addon.version = '1.1'
+addon.version = '1.3'
 addon.desc    = 'Displays a cursor of your choice that can be colored and scaled, anchored correctly on every model'
 
 -- A fork of `customtarget`, written by Jyouya and extended by yzyii, whose v0.6
@@ -89,6 +89,30 @@ local objectPosOffset = 0x34   -- Position offset inside a target-actor struct t
                                -- index (moghouse doors). Copies also exist at 0xC4 and 0xD4.
                                -- Only change this if a client update moves the field.
                                -- default: 0x34
+
+-- Mount anchoring: when a target has a mount linked, the cursor anchors on
+-- the Mount's own skeleton instead of the rider's (see mountAnchorBone).
+local mountLinkOffset = 0x768  -- offset of the mount pointer.
+
+-- Which bone of the mount's own skeleton supplies the height once mounted.
+-- Change live with /tc mountbone <n> while mounted.
+local mountAnchorBone = 2      -- default: 2
+
+local mountAnchorHeightByRace = {
+    [1] = 0.8,    -- Hume M
+    [2] = 0.8,    -- Hume F
+    [3] = 0.46,   -- Elvaan M
+    [4] = 0.46,   -- Elvaan F
+    [5] = 0.1,    -- Tarutaru M
+    [6] = 0.1,    -- Tarutaru F
+    [7] = 0.8,    -- Mithra
+    [8] = 0.62,   -- Galka
+}
+
+-- Extra lift for a /sitchair target, on top of anchorHeight, for the
+-- same reason mounting needs one.
+local sitAnimationPlayValue = 24 -- GetAnimationPlay() value confirmed for /sitchair
+local sitAnchorHeight = 0.5      -- live-calibrated 2026-10-02 (Tarutaru, Mithra, Galka, Elvaan)
 
 -- Library bindings. Below the settings so the editable values come first.
 local d3d               = require('d3d8')
@@ -262,18 +286,46 @@ local function getModelScale(pointer)
     return s
 end
 
+-- Candidate pose-aware bounding field
+local function getBoundingTriple(pointer)
+    local bx = ashita.memory.read_float(pointer + 0x18C)
+    local by = ashita.memory.read_float(pointer + 0x190)
+    local bz = ashita.memory.read_float(pointer + 0x194)
+    return bx, by, bz
+end
+
+-- Read the candidate mount pointer. Returns 0 (not nil) when there is none,
+-- or when the attached skeleton isn't a real mount (fishing rod / chair prop).
+local mountBoneCount = 58 -- confirmed chocobo skeleton size; fishing rod = 9, chair = 3
+local function mountPointerFor(pointer)
+    local m = ashita.memory.read_uint32(pointer + mountLinkOffset)
+    if (m == nil or m <= 0x10000 or m >= 0x7FFF0000) then return 0 end
+    local skel = skeletonOf(m)
+    local boneCount = (skel ~= 0) and ashita.memory.read_uint16(skel + 0x32) or 0
+    if (boneCount ~= mountBoneCount) then return 0 end
+    return m
+end
+
 local function anchorFromModel(pointer, idx)
-    local scale = getModelScale(pointer)
+    -- Mounted: anchor on the MOUNT's own skeleton and scale instead of the
+    -- rider's. The render base stays the rider's own (confirmed identical).
+    local mountPtr = mountPointerFor(pointer)
+    local sourcePointer = (mountPtr ~= 0) and mountPtr or pointer
+    local sourceBone = (mountPtr ~= 0) and mountAnchorBone or anchorBone
+
+    local scale = getModelScale(sourcePointer)
     local bx, by, bz = getActorBase(pointer)
 
     local delta = 0
-    if (anchorBone >= 0) then
-        delta = getBoneOffsetZ(pointer, anchorBone)
+    if (sourceBone >= 0) then
+        delta = getBoneOffsetZ(sourcePointer, sourceBone)
     end
 
-    -- New occupant on this index: throw the inherited value away and snap.
-    if (smoothOwner[idx] ~= pointer) then
-        smoothOwner[idx] = pointer
+    -- Owner key is whichever pointer is currently supplying the bone data,
+    -- so mounting/dismounting snaps immediately like any other subject change.
+    local owner = sourcePointer
+    if (smoothOwner[idx] ~= owner) then
+        smoothOwner[idx] = owner
         smoothDelta[idx] = nil
     end
 
@@ -284,7 +336,18 @@ local function anchorFromModel(pointer, idx)
     local damped = prev + (delta - prev) * anchorSmoothing
     smoothDelta[idx] = damped
 
-    return bx, by, bz + (damped * scale) - anchorHeight
+    -- Only applies when a mount supplied the bone data. Keyed by the
+    -- rider's own race, then scaled the same way the bone delta above is.
+    local extraLift = 0
+    local ent = AshitaCore:GetMemoryManager():GetEntity()
+    if (mountPtr ~= 0) then
+        local race = ent:GetRace(idx)
+        local raceLift = mountAnchorHeightByRace[race] or 0
+        extraLift = raceLift * scale
+    elseif (ent:GetAnimationPlay(idx) == sitAnimationPlayValue) then
+        extraLift = sitAnchorHeight * scale
+    end
+    return bx, by, bz + (damped * scale) - anchorHeight - extraLift
 end
 
 local function rangeColorFor(idx)
@@ -432,27 +495,61 @@ ashita.events.register('command', 'targetcursor_cmd', function(e)
     end
     e.blocked = true
 
+    -- Which mountheight slot the CURRENT target would actually use, so
+    -- report() and the mountheight command can say something meaningful
+    -- about a per-race table rather than printing the whole table every time.
+    local function currentMountHeightSlot()
+        local i = lastTargetInfo
+        if (i == nil or i.idx == nil or i.idx == 0) then
+            return nil, 0, '(no target)'
+        end
+        local ent = AshitaCore:GetMemoryManager():GetEntity()
+        local race = ent:GetRace(i.idx)
+        return race, (mountAnchorHeightByRace[race] or 0),
+            (mountAnchorHeightByRace[race] ~= nil) and 'measured' or 'unmapped'
+    end
+
     local function report()
+        local race, mh, mhSrc = currentMountHeightSlot()
+        -- Live readout of the candidate bounding field (see
+        -- getBoundingTriple's own comment) for whatever is currently
+        -- targeted, own pointer only
+        local bbz = 0
+        do
+            local i = lastTargetInfo
+            if (i ~= nil and i.ptr ~= nil and i.ptr ~= 0) then
+                local _, _, z = getBoundingTriple(i.ptr)
+                bbz = z
+            end
+        end
         print(chat.header('targetcursor'):append(chat.message(string.format(
-            'bone=%d height=%.3f smoothing=%.3f  (session only)',
-            anchorBone, anchorHeight, anchorSmoothing))))
+            'bone=%d mountbone=%d height=%.3f mountheight[race %s]=%.3f (%s) sitheight=%.3f smoothing=%.3f bbox.z=%.3f  (session only)',
+            anchorBone, mountAnchorBone, anchorHeight, tostring(race), mh, mhSrc, sitAnchorHeight, anchorSmoothing, bbz))))
     end
 
     if (#args >= 3 and args[2] == 'height') then
         anchorHeight = tonumber(args[3]) or anchorHeight
-        -- Both tables, not just the damped values: smoothOwner is what decides
-        -- whether an inherited value is thrown away, so clearing one without the
-        -- other leaves the guard holding a stale owner. It happens to work out
-        -- through the nil check below, but only by luck.
         smoothDelta = {}
         smoothOwner = {}
         report()
     elseif (#args >= 3 and args[2] == 'bone') then
         anchorBone = tonumber(args[3]) or anchorBone
-        -- Both tables, not just the damped values: smoothOwner is what decides
-        -- whether an inherited value is thrown away, so clearing one without the
-        -- other leaves the guard holding a stale owner. It happens to work out
-        -- through the nil check below, but only by luck.
+        smoothDelta = {}
+        smoothOwner = {}
+        report()
+    elseif (#args >= 3 and args[2] == 'mountbone') then
+        mountAnchorBone = tonumber(args[3]) or mountAnchorBone
+        smoothDelta = {}
+        smoothOwner = {}
+        report()
+    elseif (#args >= 3 and args[2] == 'mountheight') then
+        local n = tonumber(args[3])
+        if (n ~= nil) then
+            local race = currentMountHeightSlot()
+            if (race ~= nil) then
+                mountAnchorHeightByRace[race] = n
+            end
+        end
         smoothDelta = {}
         smoothOwner = {}
         report()
@@ -464,6 +561,10 @@ ashita.events.register('command', 'targetcursor_cmd', function(e)
             '/tc height <n>  vertical nudge, world units, positive raises')))
         print(chat.header('targetcursor'):append(chat.message(
             '/tc bone <n>    anchor bone, -1 = model base')))
+        print(chat.header('targetcursor'):append(chat.message(
+            '/tc mountbone <n>  anchor bone on a linked mount\'s own skeleton')))
+        print(chat.header('targetcursor'):append(chat.message(
+            '/tc mountheight <n>  extra lift, on top of height, for the CURRENT target\'s race')))
         print(chat.header('targetcursor'):append(chat.message(
             '/tc smooth <n>  0-1, how fast the height follows the bone')))
         report()
@@ -479,23 +580,6 @@ ashita.events.register('load', 'targetcursor_load', function()
 
         -- Determine if we are currently subtargetting
         local isSubTargetActive = target:GetIsSubTargetActive()
-
-        -- Exit early only if NEITHER slot has an active target.
-        --
-        -- This used to be target:GetIsActive(isSubTargetActive) - checking only
-        -- the slot isSubTargetActive currently points at. Bug: fighting mob A
-        -- (locked, slot 0) while sub-targeting an ability onto mob B (slot 1)
-        -- and mob A dies mid-selection clears slot 0's Active flag; with
-        -- isSubTargetActive still 1 that alone should not have mattered, but
-        -- the client also appears to drop out of sub-targeting the instant its
-        -- locked target dies, which flips isSubTargetActive to 0 THIS SAME
-        -- FRAME - so the very next line ends up testing slot 0 (mob A, now
-        -- dead) instead of slot 1 (mob B, still a live, still-valid subtarget).
-        -- That single check then bailed out of the WHOLE frame, before the
-        -- independent targetIndexSub branch below ever ran - erasing the still-
-        -- valid sub cursor over mob B along with the main cursor. The real
-        -- client keeps its own cursor over mob B in this situation; checking
-        -- both slots here before giving up lets this addon do the same.
         if (target:GetIsActive(0) == 0 and target:GetIsActive(1) == 0) then
             return
         end
