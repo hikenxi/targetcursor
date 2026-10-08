@@ -1,6 +1,6 @@
 addon.name    = 'targetcursor'
 addon.author  = 'Jyouya (original), yzyii (sub cursor), Hiken (fork)'
-addon.version = '1.3'
+addon.version = '1.2'
 addon.desc    = 'Displays a cursor of your choice that can be colored and scaled, anchored correctly on every model'
 
 -- A fork of `customtarget`, written by Jyouya and extended by yzyii, whose v0.6
